@@ -174,12 +174,14 @@ class HistoricalDataManager:
         return worker_metrics
     
     def _calculate_coverage_metrics(self) -> Dict[str, Any]:
-        """Calculate overall schedule coverage and gap analysis"""
+        """Calculate overall schedule coverage and gap analysis with enhanced insights"""
         coverage_metrics = {
             'overall_coverage': 0.0,
             'post_coverage': {},
             'time_gaps': [],
-            'critical_gaps': []
+            'critical_gaps': [],
+            'coverage_distribution': {},  # NEW: Post coverage distribution stats
+            'improvement_opportunities': []  # NEW: Identified improvement opportunities
         }
         
         total_slots = 0
@@ -216,8 +218,40 @@ class HistoricalDataManager:
         coverage_metrics['overall_coverage'] = filled_slots / total_slots if total_slots > 0 else 0
         
         # Calculate post-specific coverage rates
+        coverage_rates = []
         for post_num, data in post_coverage.items():
-            coverage_metrics['post_coverage'][post_num] = data['filled'] / data['total'] if data['total'] > 0 else 0
+            coverage_rate = data['filled'] / data['total'] if data['total'] > 0 else 0
+            coverage_metrics['post_coverage'][post_num] = coverage_rate
+            coverage_rates.append(coverage_rate)
+        
+        # NEW: Enhanced coverage distribution analysis
+        if coverage_rates:
+            coverage_metrics['coverage_distribution'] = {
+                'min_coverage': min(coverage_rates),
+                'max_coverage': max(coverage_rates),
+                'avg_coverage': sum(coverage_rates) / len(coverage_rates),
+                'coverage_variance': sum((rate - (sum(coverage_rates) / len(coverage_rates))) ** 2 
+                                       for rate in coverage_rates) / len(coverage_rates),
+                'posts_below_average': len([rate for rate in coverage_rates 
+                                          if rate < (sum(coverage_rates) / len(coverage_rates))])
+            }
+            
+            # NEW: Identify improvement opportunities
+            avg_coverage = sum(coverage_rates) / len(coverage_rates)
+            for post_num, rate in coverage_metrics['post_coverage'].items():
+                if rate < avg_coverage * 0.8:  # Posts with coverage significantly below average
+                    gap_count = sum(1 for gap in coverage_metrics['time_gaps'] if gap['post'] == post_num)
+                    critical_gap_count = sum(1 for gap in coverage_metrics['critical_gaps'] 
+                                           if gap['post'] == post_num)
+                    
+                    coverage_metrics['improvement_opportunities'].append({
+                        'post': post_num,
+                        'current_coverage': rate,
+                        'coverage_gap': avg_coverage - rate,
+                        'total_gaps': gap_count,
+                        'critical_gaps': critical_gap_count,
+                        'priority': 'high' if critical_gap_count > 0 else 'medium'
+                    })
         
         return coverage_metrics
     
