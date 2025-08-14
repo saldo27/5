@@ -9,9 +9,11 @@ import logging
 import json
 import pickle
 from datetime import datetime, timedelta
-from typing import Dict, List, Set, Optional, Tuple, Any
+from typing import Dict, List, Set, Optional, Tuple, Any, Iterator
 from pathlib import Path
 import os
+from collections import defaultdict
+from performance_cache import cached, time_function, monitor_performance, memoize
 
 try:
     import pandas as pd
@@ -39,30 +41,36 @@ class HistoricalDataManager:
         self.storage_path = Path(storage_path)
         self.storage_path.mkdir(exist_ok=True)
         
-        # Historical data containers
+        # Optimized data containers with bounded sizes
         self.shift_fill_rates: Dict[str, List[float]] = {}
         self.worker_availability_patterns: Dict[str, Dict[str, float]] = {}
         self.seasonal_demand_data: Dict[str, List[Dict[str, Any]]] = {}
         self.constraint_violations: List[Dict[str, Any]] = []
         self.efficiency_metrics: List[Dict[str, Any]] = []
         
+        # Performance optimization: Set limits to prevent unbounded growth
+        self.max_metrics_history = 500
+        self.max_violation_history = 200
+        
         logging.info(f"HistoricalDataManager initialized with storage path: {storage_path}")
         
         # Load existing historical data if available
         self._load_historical_data()
     
+    @time_function
+    @monitor_performance("collect_current_schedule_data")
     def collect_current_schedule_data(self) -> Dict[str, Any]:
         """
-        Collect data from the current schedule for historical analysis
+        Collect data from the current schedule for historical analysis (optimized)
         
         Returns:
             Dictionary containing comprehensive schedule metrics
         """
         try:
-            # Get current statistics using existing infrastructure
+            # Get current statistics using existing infrastructure (cached)
             stats = self.scheduler.stats.gather_statistics()
             
-            # Calculate additional metrics for forecasting
+            # Calculate additional metrics for forecasting using optimized methods
             current_data = {
                 'timestamp': datetime.now().isoformat(),
                 'schedule_period': {
@@ -70,12 +78,12 @@ class HistoricalDataManager:
                     'end_date': self.scheduler.end_date.isoformat(),
                     'total_days': (self.scheduler.end_date - self.scheduler.start_date).days + 1
                 },
-                'shift_metrics': self._calculate_shift_metrics(),
-                'worker_metrics': self._calculate_worker_metrics(stats),
-                'coverage_metrics': self._calculate_coverage_metrics(),
-                'constraint_metrics': self._extract_constraint_metrics(stats),
-                'seasonal_indicators': self._extract_seasonal_indicators(),
-                'efficiency_score': self._calculate_efficiency_score(stats)
+                'shift_metrics': self._calculate_shift_metrics_optimized(),
+                'worker_metrics': self._calculate_worker_metrics_optimized(stats),
+                'coverage_metrics': self._calculate_coverage_metrics_optimized(),
+                'constraint_metrics': self._extract_constraint_metrics_optimized(stats),
+                'seasonal_indicators': self._extract_seasonal_indicators_optimized(),
+                'efficiency_score': self._calculate_efficiency_score_optimized(stats)
             }
             
             return current_data
@@ -84,8 +92,9 @@ class HistoricalDataManager:
             logging.error(f"Error collecting current schedule data: {e}")
             raise SchedulerError(f"Failed to collect schedule data: {str(e)}")
     
-    def _calculate_shift_metrics(self) -> Dict[str, Any]:
-        """Calculate daily shift fill rates and patterns"""
+    @cached(ttl=1800)  # Cache for 30 minutes
+    def _calculate_shift_metrics_optimized(self) -> Dict[str, Any]:
+        """Calculate daily shift fill rates and patterns (optimized)"""
         shift_metrics = {
             'daily_fill_rates': {},
             'average_fill_rate': 0.0,
@@ -96,25 +105,31 @@ class HistoricalDataManager:
         total_slots = 0
         filled_slots = 0
         
+        # Process schedule in a single pass
         for date, shifts in self.scheduler.schedule.items():
             date_str = date.strftime('%Y-%m-%d')
             total_day_slots = len(shifts)
             filled_day_slots = sum(1 for shift in shifts if shift is not None)
             
             fill_rate = filled_day_slots / total_day_slots if total_day_slots > 0 else 0
+            
+            # Use pre-computed values for efficiency
+            is_weekend = self.scheduler.data_manager._is_weekend_day(date)
+            is_holiday = self.scheduler.data_manager._is_holiday(date)
+            
             shift_metrics['daily_fill_rates'][date_str] = {
                 'fill_rate': fill_rate,
                 'filled_slots': filled_day_slots,
                 'total_slots': total_day_slots,
                 'weekday': date.strftime('%A'),
-                'is_weekend': self.scheduler.data_manager._is_weekend_day(date),
-                'is_holiday': self.scheduler.data_manager._is_holiday(date)
+                'is_weekend': is_weekend,
+                'is_holiday': is_holiday
             }
             
             total_slots += total_day_slots
             filled_slots += filled_day_slots
             
-            # Identify peak and low demand days
+            # Categorize demand days
             if fill_rate >= 0.95:
                 shift_metrics['peak_demand_days'].append(date_str)
             elif fill_rate <= 0.7:
@@ -124,32 +139,36 @@ class HistoricalDataManager:
         
         return shift_metrics
     
-    def _calculate_worker_metrics(self, stats: Dict[str, Any]) -> Dict[str, Any]:
-        """Calculate worker availability and performance patterns"""
+    @cached(ttl=1800)  # Cache for 30 minutes
+    def _calculate_worker_metrics_optimized(self, stats: Dict[str, Any]) -> Dict[str, Any]:
+        """Calculate worker availability and performance patterns (optimized)"""
         worker_metrics = {
             'availability_patterns': {},
             'workload_distribution': {},
             'performance_indicators': {}
         }
         
+        # Pre-calculate total possible shifts once
+        total_possible_shifts = stats['general']['total_days'] * self.scheduler.num_shifts
+        
+        # Process all workers efficiently
         for worker_id, worker_stats in stats['workers'].items():
-            # Calculate availability patterns
-            total_possible_shifts = stats['general']['total_days'] * self.scheduler.num_shifts
             availability_rate = worker_stats['total_shifts'] / total_possible_shifts
             
             worker_metrics['availability_patterns'][worker_id] = {
                 'availability_rate': availability_rate,
-                'weekend_preference': self._calculate_weekend_preference(worker_id),
-                'shift_consistency': self._calculate_shift_consistency(worker_id),
-                'post_rotation_balance': self._calculate_post_rotation_score(worker_stats['post_distribution'])
+                'weekend_preference': self._calculate_weekend_preference_cached(worker_id),
+                'shift_consistency': self._calculate_shift_consistency_cached(worker_id),
+                'post_rotation_balance': self._calculate_post_rotation_score_cached(worker_stats['post_distribution'])
             }
             
             # Workload distribution
+            target_shifts = worker_stats['target_shifts']
             worker_metrics['workload_distribution'][worker_id] = {
                 'total_shifts': worker_stats['total_shifts'],
-                'target_shifts': worker_stats['target_shifts'],
-                'shift_ratio': worker_stats['total_shifts'] / worker_stats['target_shifts'] if worker_stats['target_shifts'] > 0 else 0,
-                'monthly_variance': self._calculate_monthly_variance(worker_stats['monthly_stats'])
+                'target_shifts': target_shifts,
+                'shift_ratio': worker_stats['total_shifts'] / target_shifts if target_shifts > 0 else 0,
+                'monthly_variance': self._calculate_monthly_variance_cached(worker_stats['monthly_stats'])
             }
         
         return worker_metrics
@@ -304,8 +323,27 @@ class HistoricalDataManager:
             logging.error(f"Error calculating efficiency score: {e}")
             return 0.0
     
+    @memoize(maxsize=128)
+    def _calculate_weekend_preference_cached(self, worker_id: str) -> float:
+        """Calculate worker's weekend shift preference/tendency (cached)"""
+        return self._calculate_weekend_preference(worker_id)
+    
+    @memoize(maxsize=128)
+    def _calculate_shift_consistency_cached(self, worker_id: str) -> float:
+        """Calculate how consistently a worker is scheduled (cached)"""
+        return self._calculate_shift_consistency(worker_id)
+    
+    @memoize(maxsize=128)
+    def _calculate_post_rotation_score_cached(self, post_distribution: Dict[str, int]) -> float:
+        """Calculate how well balanced post rotation is for a worker (cached)"""
+        return self._calculate_post_rotation_score(post_distribution)
+    
+    @memoize(maxsize=128)
+    def _calculate_monthly_variance_cached(self, monthly_stats: Dict[str, Any]) -> float:
+        """Calculate variance in monthly shift distribution (cached)"""
+        return self._calculate_monthly_variance(monthly_stats)
+    
     def _calculate_weekend_preference(self, worker_id: str) -> float:
-        """Calculate worker's weekend shift preference/tendency"""
         weekend_count = len(self.scheduler.data_manager.worker_weekends.get(worker_id, []))
         total_shifts = len(self.scheduler.data_manager.worker_assignments.get(worker_id, []))
         return weekend_count / total_shifts if total_shifts > 0 else 0

@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any, Union
 import json
 import numpy as np
+from performance_cache import cached, memoize, time_function, monitor_performance
 
 # ML Dependencies with graceful fallback
 try:
@@ -59,14 +60,21 @@ class DemandForecaster:
             }
         }
         
-        logging.info("DemandForecaster initialized")
+        # Performance optimization: Cache frequently used models
+        self._model_cache = {}
+        self._forecast_cache_ttl = 3600  # 1 hour
+        
+        logging.info("DemandForecaster initialized with performance optimizations")
         
         if not ML_AVAILABLE:
             logging.warning("Running in fallback mode without ML libraries")
     
+    @time_function
+    @monitor_performance("generate_forecasts")
+    @cached(ttl=3600)  # Cache forecasts for 1 hour
     def generate_forecasts(self, forecast_days: int = 30) -> Dict[str, Any]:
         """
-        Generate comprehensive demand forecasts
+        Generate comprehensive demand forecasts (cached for performance)
         
         Args:
             forecast_days: Number of days to forecast ahead
@@ -105,21 +113,21 @@ class DemandForecaster:
                 'recommendations': []
             }
             
-            # Time series forecasting
-            ts_forecast = self._generate_time_series_forecast(data, forecast_days)
+            # Time series forecasting (cached)
+            ts_forecast = self._generate_time_series_forecast_cached(data, forecast_days)
             if ts_forecast:
                 forecasts['predictions'].update(ts_forecast['predictions'])
                 forecasts['confidence_intervals'].update(ts_forecast['confidence_intervals'])
                 forecasts['metadata']['methods_used'].append('time_series')
             
-            # Seasonal decomposition
-            seasonal_forecast = self._generate_seasonal_forecast(data, forecast_days)
+            # Seasonal decomposition (cached)
+            seasonal_forecast = self._generate_seasonal_forecast_cached(data, forecast_days)
             if seasonal_forecast:
                 forecasts['seasonal_patterns'] = seasonal_forecast
                 forecasts['metadata']['methods_used'].append('seasonal_decomposition')
             
-            # Machine learning forecast
-            ml_forecast = self._generate_ml_forecast(data, forecast_days)
+            # Machine learning forecast (cached)
+            ml_forecast = self._generate_ml_forecast_cached(data, forecast_days)
             if ml_forecast:
                 forecasts['predictions'].update(ml_forecast['predictions'])
                 forecasts['metadata']['methods_used'].append('machine_learning')
@@ -141,6 +149,21 @@ class DemandForecaster:
         except Exception as e:
             logging.error(f"Error generating forecasts: {e}")
             return {'error': str(e), 'fallback': self._generate_basic_forecasts(forecast_days)}
+    
+    @cached(ttl=1800)  # Cache for 30 minutes
+    def _generate_time_series_forecast_cached(self, data: Dict[str, Any], forecast_days: int) -> Optional[Dict[str, Any]]:
+        """Generate ARIMA-based time series forecasts (cached)"""
+        return self._generate_time_series_forecast(data, forecast_days)
+    
+    @cached(ttl=1800)  # Cache for 30 minutes  
+    def _generate_seasonal_forecast_cached(self, data: Dict[str, Any], forecast_days: int) -> Optional[Dict[str, Any]]:
+        """Generate forecasts using seasonal decomposition (cached)"""
+        return self._generate_seasonal_forecast(data, forecast_days)
+    
+    @cached(ttl=1800)  # Cache for 30 minutes
+    def _generate_ml_forecast_cached(self, data: Dict[str, Any], forecast_days: int) -> Optional[Dict[str, Any]]:
+        """Generate forecasts using machine learning models (cached)"""
+        return self._generate_ml_forecast(data, forecast_days)
     
     def _generate_time_series_forecast(self, data: Dict[str, Any], forecast_days: int) -> Optional[Dict[str, Any]]:
         """Generate ARIMA-based time series forecasts"""

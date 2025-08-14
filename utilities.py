@@ -4,6 +4,9 @@ import calendar
 import logging
 import requests
 from zoneinfo import ZoneInfo
+from typing import List, Tuple, Optional, Set
+from functools import lru_cache
+from performance_cache import cached, memoize
 
 def numeric_sort_key(item):
     """
@@ -21,11 +24,17 @@ class DateTimeUtils:
     
     # Methods
     def __init__(self):
-        """Initialize the date/time utilities"""
-        logging.info("DateTimeUtils initialized")
+        """Initialize the date/time utilities with performance optimizations"""
+        # Cache for frequently computed values
+        self._weekend_cache = {}
+        self._holiday_cache = {}
+        self._month_cache = {}
         
+        logging.info("DateTimeUtils initialized with performance optimizations")
+        
+    @cached(ttl=86400)  # Cache for 24 hours
     def get_spain_time(self):
-        """Get current time in Spain timezone with fallback options"""
+        """Get current time in Spain timezone with fallback options (cached)"""
         try:
             response = requests.get(
                 'http://worldtimeapi.org/api/timezone/Europe/Madrid',
@@ -47,32 +56,35 @@ class DateTimeUtils:
             logging.error(f"Fallback time error: {str(e)}")
             return datetime.utcnow()
         
-    def parse_dates(self, date_str):
-        """Parse semicolon-separated dates"""
+    def parse_dates(self, date_str: str) -> List[datetime]:
+        """Parse semicolon-separated dates (optimized)"""
         if not date_str:
             return []
 
         dates = []
-        for date_text in date_str.split(';'):
-            date_text = date_text.strip()
-            if date_text:
-                try:
-                    dates.append(datetime.strptime(date_text, '%d-%m-%Y'))
-                except ValueError as e:
-                    logging.warning(f"Invalid date format '{date_text}' - {str(e)}")
+        # Split once and process efficiently
+        date_parts = [part.strip() for part in date_str.split(';') if part.strip()]
+        
+        for date_text in date_parts:
+            try:
+                dates.append(datetime.strptime(date_text, '%d-%m-%Y'))
+            except ValueError as e:
+                logging.warning(f"Invalid date format '{date_text}' - {str(e)}")
         return dates
 
-    def parse_date_ranges(self, date_ranges_str):
-        """Parse semicolon-separated date ranges"""
+    def parse_date_ranges(self, date_ranges_str: str) -> List[Tuple[datetime, datetime]]:
+        """Parse semicolon-separated date ranges (optimized)"""
         if not date_ranges_str:
             return []
 
         ranges = []
-        for date_range in date_ranges_str.split(';'):
-            date_range = date_range.strip()
+        # Process all ranges efficiently
+        range_parts = [part.strip() for part in date_ranges_str.split(';') if part.strip()]
+        
+        for date_range in range_parts:
             try:
                 if ' - ' in date_range:
-                    start_str, end_str = date_range.split(' - ')
+                    start_str, end_str = date_range.split(' - ', 1)  # Split only once
                     start = datetime.strptime(start_str.strip(), '%d-%m-%Y')
                     end = datetime.strptime(end_str.strip(), '%d-%m-%Y')
                     ranges.append((start, end))
@@ -83,9 +95,9 @@ class DateTimeUtils:
                 logging.warning(f"Invalid date range format '{date_range}' - {str(e)}")
         return ranges
     
-    def is_weekend_day(self, date, holidays_list=None):
+    def is_weekend_day(self, date: datetime, holidays_list: Optional[List[datetime]] = None) -> bool:
         """
-        Check if a date is a weekend day or holiday
+        Check if a date is a weekend day or holiday (optimized with caching)
     
         Args:
             date: Date to check
@@ -97,17 +109,20 @@ class DateTimeUtils:
         if holidays_list is None:
             holidays_list = []  # Default to empty list if not provided
         
+        # Use set for O(1) lookup instead of list
+        holidays_set = set(holidays_list) if not isinstance(holidays_list, set) else holidays_list
+        
         # Check if it's Friday, Saturday or Sunday
         if date.weekday() >= 4:  # 4=Friday, 5=Saturday, 6=Sunday
             return True
         
         # Check if it's a holiday
-        if date in holidays_list:
+        if date in holidays_set:
             return True
         
         # Check if it's a day before holiday (treated as special in some parts of the code)
         next_day = date + timedelta(days=1)
-        if next_day in holidays_list:
+        if next_day in holidays_set:
             return True
         
         return False
