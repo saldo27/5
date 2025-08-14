@@ -1,4 +1,11 @@
-from fpdf import FPDF
+try:
+    from fpdf import FPDF
+except ImportError:
+    try:
+        from fpdf2 import FPDF
+    except ImportError:
+        FPDF = None
+        
 import csv
 from datetime import datetime
 import calendar

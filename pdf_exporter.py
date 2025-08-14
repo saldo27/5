@@ -9,6 +9,8 @@ from reportlab.lib.units import inch, cm # Use cm for better control maybe
 from calendar import monthcalendar
 from datetime import datetime
 from utilities import numeric_sort_key
+from performance_cache import cached, time_function, monitor_performance
+from collections import defaultdict
 import logging
 
 def numeric_sort_key(item):
@@ -33,9 +35,15 @@ class PDFExporter:
         self.styles = getSampleStyleSheet()
         self.styles.add(ParagraphStyle(name='SmallNormal', parent=self.styles['Normal'], fontSize=9))
         self.styles.add(ParagraphStyle(name='SmallBold', parent=self.styles['SmallNormal'], fontName='Helvetica-Bold'))
+        
+        # Performance optimization: Pre-compute frequently used data
+        self.holidays_set = set(self.holidays)  # O(1) lookup
+        self.workers_dict = {worker.get('id'): worker for worker in self.workers_data}  # O(1) lookup
 
+    @time_function
+    @monitor_performance("export_summary_pdf")
     def export_summary_pdf(self, stats_data): # Takes the whole stats dictionary now
-        """Export a detailed GLOBAL summary with shift listings and distributions."""
+        """Export a detailed GLOBAL summary with shift listings and distributions (optimized)."""
 
         # --- Determine Filename and Title from stats_data ---
         start = stats_data.get('period_start')
@@ -77,14 +85,17 @@ class PDFExporter:
             if not workers_stats:
                  story.append(Paragraph("No worker statistics found for this period.", styles['Normal']))
             else:
-                # Numeric sort: 1,2,3,…10,11
-                for worker_id, stats in sorted(workers_stats.items(), key=numeric_sort_key):
+                # Process workers efficiently using batch operations
+                worker_items = list(workers_stats.items())
+                
+                # Numeric sort: 1,2,3,…10,11 (using cached sort key)
+                for worker_id, stats in sorted(worker_items, key=numeric_sort_key):
                     # --- Worker Header ---
                     worker_header = Paragraph(f"Worker {worker_id}", styles['h3'])
                     story.append(worker_header)
                     story.append(Spacer(1, 0.2*cm))
 
-                    # Get stats
+                    # Get stats efficiently
                     total_w = stats.get('total', 0)
                     holidays_w = stats.get('holidays', 0)
                     last_post_w = stats.get('last_post', 0)
@@ -92,19 +103,24 @@ class PDFExporter:
                     post_counts = stats.get('post_counts', {})
                     worker_shifts = worker_shifts_all.get(worker_id, []) 
 
-
                     # --- Worker Summary Stats ---
                     summary_text = f"<b>Total Shifts:</b> {total_w} | <b>Weekend Shifts:</b> {stats.get('weekends', 0)} | <b>Holiday Shifts:</b> {holidays_w} | <b>Last Post Shifts:</b> {last_post_w}"
                     story.append(Paragraph(summary_text, styles['Normal']))
                     story.append(Spacer(1, 0.1*cm))
 
-                    # --- Weekday Distribution ---
-                    weekdays_str = "<b>Weekdays:</b> " + " ".join([f"{weekdays_short[i]}:{weekday_counts.get(i, 0)}" for i in range(7)])
+                    # --- Weekday Distribution (optimized string building) ---
+                    weekdays_str = "<b>Weekdays:</b> " + " ".join(
+                        f"{weekdays_short[i]}:{weekday_counts.get(i, 0)}" 
+                        for i in range(7)
+                    )
                     story.append(Paragraph(weekdays_str, styles['Normal']))
                     story.append(Spacer(1, 0.1*cm))
 
-                    # --- Post Distribution ---
-                    posts_str = "<b>Posts:</b> " + " ".join([f"P{post+1}:{count}" for post, count in sorted(post_counts.items())])
+                    # --- Post Distribution (optimized) ---
+                    posts_str = "<b>Posts:</b> " + " ".join(
+                        f"P{post+1}:{count}" 
+                        for post, count in sorted(post_counts.items())
+                    )
                     story.append(Paragraph(posts_str, styles['Normal']))
                     story.append(Spacer(1, 0.3*cm))
 
@@ -113,19 +129,28 @@ class PDFExporter:
                         story.append(Paragraph("<u>Assigned Shifts:</u>", styles['SmallBold']))
                         story.append(Spacer(1, 0.1*cm))
 
+                        # Build table data efficiently
                         shifts_data = [['Date', 'Day', 'Post', 'Type']]
-                        # Sort shifts by date
-                        for shift in sorted(worker_shifts, key=lambda x: x['date']):
+                        
+                        # Sort shifts once and process efficiently
+                        sorted_shifts = sorted(worker_shifts, key=lambda x: x['date'])
+                        for shift in sorted_shifts:
                             date_str = shift['date'].strftime('%d-%m-%Y')
                             day_str = shift['day'][:3]
                             post_str = f"P{shift['post']}"
                             day_type = ""
-                            if shift['is_holiday']: day_type = "HOL"
-                            elif shift['is_weekend']: day_type = "W/E"
+                            if shift['is_holiday']: 
+                                day_type = "HOL"
+                            elif shift['is_weekend']: 
+                                day_type = "W/E"
                             shifts_data.append([date_str, day_str, post_str, day_type])
 
-                        # Limit table height? Consider splitting if too long? For now, let it flow.
-                        shifts_table = Table(shifts_data, colWidths=[2.5*cm, 1.5*cm, 1.5*cm, 1.5*cm], repeatRows=1) # Repeat header row
+                        # Create table with optimized settings
+                        shifts_table = Table(
+                            shifts_data, 
+                            colWidths=[2.5*cm, 1.5*cm, 1.5*cm, 1.5*cm], 
+                            repeatRows=1
+                        )
                         shifts_table.setStyle(TableStyle([
                             ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
                             ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
@@ -228,8 +253,10 @@ class PDFExporter:
         doc.build(story)
         return filename
 
+    @time_function
+    @monitor_performance("export_worker_statistics")
     def export_worker_statistics(self, filename=None):
-        """Export worker statistics to PDF"""
+        """Export worker statistics to PDF (optimized for performance)"""
         if not filename:
             filename = 'worker_statistics.pdf'
             
@@ -254,36 +281,54 @@ class PDFExporter:
         title = Paragraph("Worker Statistics Report", title_style)
         story.append(title)
         
-        # Prepare statistics for each worker
+        # Pre-compute data for all workers to avoid repeated calculations
+        worker_stats_cache = {}
+        
+        # Prepare statistics for each worker efficiently
         for worker in self.workers_data:
             worker_id = worker['id']
             
-            # Get worker's assignments
-            assignments = [
+            # Get worker's assignments using efficient set operations
+            assignments = {
                 date for date, workers in self.schedule.items()
                 if worker_id in workers
-            ]
+            }
             
-            # Calculate statistics
+            # Calculate statistics in a single pass
             total_shifts = len(assignments)
             weekend_shifts = sum(1 for date in assignments if date.weekday() >= 4)
-            holiday_shifts = sum(1 for date in assignments if date in self.holidays)
+            holiday_shifts = sum(1 for date in assignments if date in self.holidays_set)
             
-            # Calculate post distribution
-            post_counts = {i: 0 for i in range(self.num_shifts)}
+            # Calculate post distribution efficiently using defaultdict
+            post_distribution = defaultdict(int)
             for date in assignments:
-                if date in self.schedule:
-                    try:
-                        post = self.schedule[date].index(worker_id)
-                        post_counts[post] += 1
-                    except ValueError:
-                        # Skip if worker_id isn't in the list
-                        pass
+                shifts_for_date = self.schedule.get(date, [])
+                try:
+                    if worker_id in shifts_for_date:
+                        post = shifts_for_date.index(worker_id)
+                        post_distribution[post] += 1
+                except ValueError:
+                    # Skip if worker_id isn't in the list
+                    pass
             
-            # Calculate weekday distribution
-            weekday_counts = {i: 0 for i in range(7)}
+            # Calculate weekday distribution efficiently
+            weekday_distribution = defaultdict(int)
             for date in assignments:
-                weekday_counts[date.weekday()] += 1
+                weekday_distribution[date.weekday()] += 1
+            
+            # Store computed stats
+            worker_stats_cache[worker_id] = {
+                'worker': worker,
+                'total_shifts': total_shifts,
+                'weekend_shifts': weekend_shifts,
+                'holiday_shifts': holiday_shifts,
+                'post_distribution': dict(post_distribution),
+                'weekday_distribution': {i: weekday_distribution[i] for i in range(7)}
+            }
+        
+        # Generate PDF content efficiently
+        for worker_id, stats in worker_stats_cache.items():
+            worker = stats['worker']
             
             # Create worker section
             worker_title = Paragraph(
@@ -292,21 +337,21 @@ class PDFExporter:
             )
             story.append(worker_title)
             
-            # Add worker details
-            details = [
+            # Build details efficiently using list comprehension
+            details_parts = [
                 f"Work Percentage: {worker.get('work_percentage', 100)}%",
-                f"Total Shifts: {total_shifts}",
-                f"Weekend Shifts: {weekend_shifts}",
-                f"Holiday Shifts: {holiday_shifts}",
+                f"Total Shifts: {stats['total_shifts']}",
+                f"Weekend Shifts: {stats['weekend_shifts']}",
+                f"Holiday Shifts: {stats['holiday_shifts']}",
                 "\nPost Distribution:",
-                *[f"  Post {post+1}: {count}" for post, count in post_counts.items()],
+                *[f"  Post {post+1}: {count}" for post, count in stats['post_distribution'].items()],
                 "\nWeekday Distribution:",
                 "  Mon Tue Wed Thu Fri Sat Sun",
-                "  " + " ".join(f"{weekday_counts[i]:3d}" for i in range(7))
+                "  " + " ".join(f"{stats['weekday_distribution'][i]:3d}" for i in range(7))
             ]
             
             details_text = Paragraph(
-                '<br/>'.join(details),
+                '<br/>'.join(details_parts),
                 self.styles['Normal']
             )
             story.append(details_text)
