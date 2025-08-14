@@ -1,8 +1,10 @@
 # Imports
 import logging
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict, List, Set, Any, Optional
+from collections import defaultdict, Counter
 from exceptions import SchedulerError
+from performance_cache import cached, memoize, time_function, monitor_performance
 if TYPE_CHECKING:
     from scheduler import Schedulerr
 
@@ -32,12 +34,21 @@ class StatisticsCalculator:
         
         # Add constraint_skips reference
         self.constraint_skips = scheduler.constraint_skips
+        
+        # Performance optimization: Pre-compute worker ID set for O(1) lookups
+        self.worker_ids = {worker['id'] for worker in self.workers_data}
+        
+        # Cache for expensive computations
+        self._monthly_distribution_cache = {}
+        self._gaps_analysis_cache = {}
+        self._post_counts_cache = {}
     
-        logging.info("StatisticsCalculator initialized")
+        logging.info("StatisticsCalculator initialized with performance optimizations")
     
+    @memoize(maxsize=256)
     def get_post_counts(self, worker_id):
         """
-        Get the counts of different posts for a worker
+        Get the counts of different posts for a worker (cached for performance)
         
         Args:
             worker_id: The worker ID to check
@@ -46,44 +57,58 @@ class StatisticsCalculator:
         """
         if worker_id not in self.worker_posts:
             return {}
-            
-        post_counts = {}
-        for post in self.worker_posts[worker_id]:
-            post_counts[post] = post_counts.get(post, 0) + 1
         
-        return post_counts
+        # Use Counter for efficient counting
+        return dict(Counter(self.worker_posts[worker_id]))
     
+    @cached(ttl=1800)  # Cache for 30 minutes
     def _get_monthly_distribution(self, worker_id):
         """
-        Get monthly shift distribution for a worker
+        Get monthly shift distribution for a worker (cached for performance)
         
         Args:
             worker_id: The worker's ID
         Returns:
             dict: Monthly shift counts {YYYY-MM: count}
         """
-        distribution = {}
-        for date in sorted(list(self.worker_assignments[worker_id])):
+        # Use defaultdict for efficient counting
+        distribution = defaultdict(int)
+        
+        # Get assignments once and iterate efficiently
+        assignments = self.worker_assignments.get(worker_id, set())
+        
+        for date in assignments:
             month_key = f"{date.year}-{date.month:02d}"
-            distribution[month_key] = distribution.get(month_key, 0) + 1
-        return distribution
+            distribution[month_key] += 1
+            
+        return dict(distribution)
     
+    @cached(ttl=1800)  # Cache for 30 minutes  
     def _analyze_gaps(self, worker_id):
         """
-        Analyze gaps between shifts for a worker
+        Analyze gaps between shifts for a worker (cached for performance)
         
         Args:
             worker_id: The worker's ID
         Returns:
             dict: Statistics about gaps between assignments
         """
-        assignments = sorted(list(self.worker_assignments[worker_id]))
+        assignments = self.worker_assignments.get(worker_id, set())
+        
         if len(assignments) <= 1:
             return {'min_gap': None, 'max_gap': None, 'avg_gap': None}
 
-        gaps = [(assignments[i+1] - assignments[i]).days 
-                for i in range(len(assignments)-1)]
+        # Sort assignments once
+        sorted_assignments = sorted(assignments)
         
+        # Calculate gaps in a single pass using list comprehension
+        gaps = [(sorted_assignments[i+1] - sorted_assignments[i]).days 
+                for i in range(len(sorted_assignments)-1)]
+        
+        if not gaps:
+            return {'min_gap': None, 'max_gap': None, 'avg_gap': None}
+        
+        # Use built-in functions for efficiency
         return {
             'min_gap': min(gaps),
             'max_gap': max(gaps),
@@ -108,46 +133,60 @@ class StatisticsCalculator:
                 return weekday
         return 0  # Fallback to Monday if something goes wrong
 
+    @time_function
+    @monitor_performance("gather_statistics")
     def gather_statistics(self):
         """
-        Gather comprehensive schedule statistics
+        Gather comprehensive schedule statistics (optimized for performance)
         
         Returns:
             dict: Detailed statistics about the schedule and worker assignments
         """
+        # Pre-calculate general stats once
+        total_days = (self.end_date - self.start_date).days + 1
+        total_shifts = sum(len(shifts) for shifts in self.schedule.values())
+        
+        # Calculate constraint skips efficiently using generator expressions
+        constraint_skips_summary = {
+            'gap': sum(len(skips.get('gap', [])) for skips in self.constraint_skips.values()),
+            'incompatibility': sum(len(skips.get('incompatibility', [])) for skips in self.constraint_skips.values()),
+            'reduced_gap': sum(len(skips.get('reduced_gap', [])) for skips in self.constraint_skips.values())
+        }
+        
         stats = {
             'general': {
-                'total_days': (self.end_date - self.start_date).days + 1,
-                'total_shifts': sum(len(shifts) for shifts in self.schedule.values()),
-                'constraint_skips': {
-                    'gap': sum(len(skips['gap']) for skips in self.constraint_skips.values()),
-                    'incompatibility': sum(len(skips['incompatibility']) for skips in self.constraint_skips.values()),
-                    'reduced_gap': sum(len(skips['reduced_gap']) for skips in self.constraint_skips.values())
-                }
+                'total_days': total_days,
+                'total_shifts': total_shifts,
+                'constraint_skips': constraint_skips_summary
             },
             'workers': {}
         }
 
+        # Process workers in batch for better cache locality
         for worker in self.workers_data:
             worker_id = worker['id']
-            assignments = self.worker_assignments[worker_id]
             
+            # Get all data for this worker once
+            assignments = self.worker_assignments.get(worker_id, set())
             monthly_dist = self._get_monthly_distribution(worker_id)
+            
+            # Calculate monthly stats efficiently
+            monthly_values = list(monthly_dist.values()) if monthly_dist else [0]
             monthly_stats = {
                 'distribution': monthly_dist,
-                'min_monthly': min(monthly_dist.values()) if monthly_dist else 0,
-                'max_monthly': max(monthly_dist.values()) if monthly_dist else 0,
-                'monthly_imbalance': max(monthly_dist.values()) - min(monthly_dist.values()) if monthly_dist else 0
+                'min_monthly': min(monthly_values),
+                'max_monthly': max(monthly_values),
+                'monthly_imbalance': max(monthly_values) - min(monthly_values)
             }
             
             stats['workers'][worker_id] = {
                 'total_shifts': len(assignments),
                 'target_shifts': worker.get('target_shifts', 0),
                 'work_percentage': worker.get('work_percentage', 100),
-                'weekend_shifts': len(self.worker_weekends[worker_id]),
-                'weekday_distribution': self.worker_weekdays[worker_id],
-                'post_distribution': self.get_post_counts(worker_id),  # Use the existing method
-                'constraint_skips': self.constraint_skips[worker_id],
+                'weekend_shifts': len(self.worker_weekends.get(worker_id, set())),
+                'weekday_distribution': self.worker_weekdays.get(worker_id, {}),
+                'post_distribution': self.get_post_counts(worker_id),
+                'constraint_skips': self.constraint_skips.get(worker_id, {}),
                 'monthly_stats': monthly_stats,
                 'gaps_analysis': self._analyze_gaps(worker_id)
             }
@@ -157,26 +196,35 @@ class StatisticsCalculator:
         
         return stats
 
+    @cached(ttl=3600)  # Cache for 1 hour
     def _analyze_monthly_balance(self):
         """
-        Analyze monthly balance across all workers
+        Analyze monthly balance across all workers (cached for performance)
         
         Returns:
             dict: Statistics about monthly distribution balance
         """
         monthly_stats = {}
         
-        # Get all months in schedule period
-        all_months = set()
-        for worker_id in self.worker_assignments:
-            dist = self._get_monthly_distribution(worker_id)
-            all_months.update(dist.keys())
+        # Collect all months efficiently using set comprehension
+        all_months = {
+            f"{date.year}-{date.month:02d}"
+            for assignments in self.worker_assignments.values()
+            for date in assignments
+        }
+        
+        # Pre-compute monthly distributions for all workers
+        worker_monthly_distributions = {
+            worker_id: self._get_monthly_distribution(worker_id)
+            for worker_id in self.worker_assignments
+        }
         
         for month in sorted(all_months):
-            worker_counts = []
-            for worker_id in self.worker_assignments:
-                dist = self._get_monthly_distribution(worker_id)
-                worker_counts.append(dist.get(month, 0))
+            # Use list comprehension for efficient data collection
+            worker_counts = [
+                worker_dist.get(month, 0)
+                for worker_dist in worker_monthly_distributions.values()
+            ]
             
             if worker_counts:
                 monthly_stats[month] = {
@@ -289,9 +337,11 @@ class StatisticsCalculator:
             )
         }
 
+    @time_function
+    @monitor_performance("calculate_statistics")
     def calculate_statistics(self):
         """
-        Calculate comprehensive statistics for the entire schedule
+        Calculate comprehensive statistics for the entire schedule (optimized)
         Returns a dictionary with various statistics
         """
         stats = {
@@ -300,17 +350,23 @@ class StatisticsCalculator:
             'coverage': 0.0
         }
     
-        # Get schedule data
+        # Get schedule data once
         schedule = self.scheduler.schedule
         worker_assignments = self.scheduler.worker_assignments
     
-        # Calculate coverage
+        # Calculate coverage efficiently
         total_shifts = (self.scheduler.end_date - self.scheduler.start_date).days * self.scheduler.num_shifts
-        filled_shifts = sum(sum(1 for worker in shifts if worker is not None) for shifts in schedule.values())
+        filled_shifts = sum(
+            sum(1 for worker in shifts if worker is not None) 
+            for shifts in schedule.values()
+        )
         coverage = (filled_shifts / total_shifts * 100) if total_shifts > 0 else 0
         stats['coverage'] = round(coverage, 2)
     
-        # Calculate stats for each worker
+        # Pre-compute holidays set for O(1) lookup
+        holidays_set = set(self.scheduler.holidays)
+        
+        # Calculate stats for each worker efficiently
         for worker in self.scheduler.workers_data:
             worker_id = worker['id']
             worker_name = worker.get('name', worker_id)
@@ -322,16 +378,24 @@ class StatisticsCalculator:
             # Get target shifts
             target_shifts = worker.get('target_shifts', 0)
         
-            # Calculate weekend shifts
-            weekend_shifts = sum(1 for date in assignments if date.weekday() >= 4 or date in self.scheduler.holidays)
+            # Calculate weekend and holiday shifts efficiently
+            weekend_shifts = sum(
+                1 for date in assignments 
+                if date.weekday() >= 4 or date in holidays_set
+            )
             weekday_shifts = total_shifts - weekend_shifts
         
-            # Calculate post distribution
-            post_distribution = {}
+            # Calculate post distribution efficiently
+            post_distribution = defaultdict(int)
             for date in assignments:
-                if date in schedule and worker_id in schedule[date]:
-                    post = schedule[date].index(worker_id)
-                    post_distribution[post] = post_distribution.get(post, 0) + 1
+                shifts_for_date = schedule.get(date, [])
+                try:
+                    if worker_id in shifts_for_date:
+                        post = shifts_for_date.index(worker_id)
+                        post_distribution[post] += 1
+                except ValueError:
+                    # Skip if worker_id isn't in the list
+                    pass
         
             # Store worker stats
             stats['workers'][worker_id] = {
@@ -340,7 +404,7 @@ class StatisticsCalculator:
                 'target_shifts': target_shifts,
                 'weekend_shifts': weekend_shifts,
                 'weekday_shifts': weekday_shifts,
-                'post_distribution': post_distribution
+                'post_distribution': dict(post_distribution)
             }
     
         return stats

@@ -2,58 +2,70 @@ from fpdf import FPDF
 import csv
 from datetime import datetime
 import calendar
+from collections import defaultdict
+from performance_cache import cached, time_function, monitor_performance
 
 class StatsExporter:
     def __init__(self, scheduler):
         self.scheduler = scheduler
+        
+        # Cache frequently accessed data for performance
+        self.workers_data = scheduler.workers_data
+        self.worker_assignments = scheduler.worker_assignments
+        self.worker_weekends = scheduler.worker_weekends
 
+    @time_function
+    @monitor_performance("gather_worker_statistics")
     def gather_worker_statistics(self):
-        """Gather comprehensive statistics for all workers"""
+        """Gather comprehensive statistics for all workers (optimized for performance)"""
         stats = {}
     
+        # Process all workers in a single pass for better cache locality
         for worker in self.workers_data:
             worker_id = worker['id']
-            assignments = self.worker_assignments[worker_id]
+            assignments = self.worker_assignments.get(worker_id, set())
+            weekend_assignments = self.worker_weekends.get(worker_id, set())
         
-            # Basic stats
+            # Calculate monthly distribution efficiently using defaultdict
+            monthly_distribution = defaultdict(int)
+            weekday_distribution = defaultdict(int)
+            
+            # Process assignments in a single pass
+            for date in assignments:
+                month_key = f"{date.year}-{date.month:02d}"
+                monthly_distribution[month_key] += 1
+                weekday_distribution[date.weekday()] += 1
+            
+            # Convert to regular dicts and fill missing weekdays
+            monthly_dist_dict = dict(monthly_distribution)
+            weekday_dist_dict = {i: weekday_distribution[i] for i in range(7)}
+            
+            # Calculate gaps efficiently
+            if len(assignments) > 1:
+                sorted_dates = sorted(assignments)
+                gaps = [(sorted_dates[i+1] - sorted_dates[i]).days 
+                       for i in range(len(sorted_dates)-1)]
+                average_gap = sum(gaps) / len(gaps)
+                min_gap = min(gaps)
+                max_gap = max(gaps)
+            else:
+                average_gap = min_gap = max_gap = 0
+            
+            # Store all stats for this worker
             stats[worker_id] = {
                 'worker_id': worker_id,
                 'work_percentage': worker.get('work_percentage', 100),
                 'total_shifts': len(assignments),
                 'target_shifts': worker.get('target_shifts', 0),
-            
-                # Shifts by type
-                'weekend_shifts': len(self.worker_weekends[worker_id]),
-                'weekday_shifts': len(assignments) - len(self.worker_weekends[worker_id]),
-            
-                # Monthly distribution
-                'monthly_distribution': {},
-            
-                # Shifts by weekday
-                'weekday_distribution': {i: 0 for i in range(7)},  # 0-6 for Monday-Sunday
-            
-                # Gaps analysis
-                'average_gap': 0,
-                'min_gap': float('inf'),
-                'max_gap': 0
+                'weekend_shifts': len(weekend_assignments),
+                'weekday_shifts': len(assignments) - len(weekend_assignments),
+                'monthly_distribution': monthly_dist_dict,
+                'weekday_distribution': weekday_dist_dict,
+                'average_gap': average_gap,
+                'min_gap': min_gap if min_gap != float('inf') else 0,
+                'max_gap': max_gap
             }
         
-            # Calculate monthly distribution
-            for date in sorted(assignments):
-                month_key = f"{date.year}-{date.month:02d}"
-                stats[worker_id]['monthly_distribution'][month_key] = \
-                    stats[worker_id]['monthly_distribution'].get(month_key, 0) + 1
-                stats[worker_id]['weekday_distribution'][date.weekday()] += 1
-        
-            # Calculate gaps
-            if len(assignments) > 1:
-                sorted_dates = sorted(assignments)
-                gaps = [(sorted_dates[i+1] - sorted_dates[i]).days 
-                       for i in range(len(sorted_dates)-1)]
-                stats[worker_id]['average_gap'] = sum(gaps) / len(gaps)
-                stats[worker_id]['min_gap'] = min(gaps)
-                stats[worker_id]['max_gap'] = max(gaps)
-            
         return stats
 
     def export_worker_stats(self, format='txt'):

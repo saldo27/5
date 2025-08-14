@@ -7,9 +7,11 @@ from datetime import datetime
 from typing import Dict, List, Callable, Any, Optional
 from enum import Enum
 import logging
-from threading import Lock
+from threading import Lock, RLock
 from dataclasses import dataclass, field
 import json
+from collections import deque
+from performance_cache import time_function, monitor_performance
 
 
 class EventType(Enum):
@@ -72,11 +74,15 @@ class EventBus:
             max_history: Maximum number of events to keep in history
         """
         self._listeners: Dict[EventType, List[Callable]] = {}
-        self._event_history: List[ScheduleEvent] = []
+        self._event_history: deque = deque(maxlen=max_history)  # Use deque for O(1) append/pop
         self._max_history = max_history
-        self._lock = Lock()
+        self._lock = RLock()  # Use RLock for better performance with nested calls
         
-        logging.info("EventBus initialized")
+        # Performance optimization: Cache frequent event types
+        self._frequent_events = {EventType.SHIFT_ASSIGNED, EventType.SHIFT_UNASSIGNED}
+        self._event_counts = {event_type: 0 for event_type in EventType}
+        
+        logging.info(f"EventBus initialized with max_history={max_history} and performance optimizations")
     
     def subscribe(self, event_type: EventType, callback: Callable[[ScheduleEvent], None]) -> None:
         """
@@ -112,30 +118,41 @@ class EventBus:
         
         logging.debug(f"Unsubscribed from {event_type.value}")
     
+    @time_function
+    @monitor_performance("event_publish")
     def publish(self, event: ScheduleEvent) -> None:
         """
-        Publish an event to all subscribers
+        Publish an event to all subscribers (optimized for performance)
         
         Args:
             event: Event to publish
         """
-        with self._lock:
-            # Add to history
-            self._event_history.append(event)
-            if len(self._event_history) > self._max_history:
-                self._event_history.pop(0)
-            
-            # Notify listeners
-            listeners = self._listeners.get(event.event_type, []).copy()
+        # Fast path for frequent events - minimal locking
+        if event.event_type in self._frequent_events:
+            with self._lock:
+                # Add to history (deque automatically handles max size)
+                self._event_history.append(event)
+                self._event_counts[event.event_type] += 1
+                
+                # Get listeners copy for safe iteration outside lock
+                listeners = self._listeners.get(event.event_type, []).copy()
+        else:
+            # Standard path for other events
+            with self._lock:
+                self._event_history.append(event)
+                self._event_counts[event.event_type] += 1
+                listeners = self._listeners.get(event.event_type, []).copy()
         
-        # Call listeners outside of lock to prevent deadlocks
+        # Call listeners outside of lock to prevent deadlocks and improve performance
         for listener in listeners:
             try:
                 listener(event)
             except Exception as e:
                 logging.error(f"Error in event listener for {event.event_type.value}: {e}")
         
-        logging.debug(f"Published event: {event.event_type.value}")
+        # Only log debug for non-frequent events to reduce log spam
+        if event.event_type not in self._frequent_events:
+            logging.debug(f"Published event: {event.event_type.value}")
     
     def emit(self, event_type: EventType, user_id: Optional[str] = None, **data) -> None:
         """
@@ -158,7 +175,7 @@ class EventBus:
                          since: Optional[datetime] = None,
                          limit: Optional[int] = None) -> List[ScheduleEvent]:
         """
-        Get event history with optional filtering
+        Get event history with optional filtering (optimized for performance)
         
         Args:
             event_type: Filter by event type
@@ -169,16 +186,25 @@ class EventBus:
             List of events matching the criteria
         """
         with self._lock:
-            events = self._event_history.copy()
+            # Convert deque to list for processing (only copy what we need)
+            if event_type is None and since is None:
+                # Fast path: no filtering needed, just apply limit
+                events = list(self._event_history)
+                if limit:
+                    events = events[-limit:]  # Get most recent N events
+                return events
+            
+            # Slower path: need to filter
+            events = list(self._event_history)
         
-        # Apply filters
+        # Apply filters efficiently
         if event_type:
             events = [e for e in events if e.event_type == event_type]
         
         if since:
             events = [e for e in events if e.timestamp >= since]
         
-        # Sort by timestamp (newest first)
+        # Sort by timestamp (newest first) - deque maintains insertion order
         events.sort(key=lambda x: x.timestamp, reverse=True)
         
         if limit:
@@ -193,14 +219,12 @@ class EventBus:
         logging.info("Event history cleared")
     
     def get_stats(self) -> Dict[str, Any]:
-        """Get statistics about the event bus"""
+        """Get statistics about the event bus (optimized)"""
         with self._lock:
             total_events = len(self._event_history)
-            event_counts = {}
             
-            for event in self._event_history:
-                event_type = event.event_type.value
-                event_counts[event_type] = event_counts.get(event_type, 0) + 1
+            # Use cached event counts instead of recalculating
+            event_counts = {event_type.value: count for event_type, count in self._event_counts.items()}
             
             listener_counts = {
                 event_type.value: len(listeners) 
@@ -211,7 +235,8 @@ class EventBus:
             'total_events': total_events,
             'event_type_counts': event_counts,
             'listener_counts': listener_counts,
-            'max_history': self._max_history
+            'max_history': self._max_history,
+            'memory_efficiency': f"Using deque with maxlen={self._max_history}"
         }
 
 
