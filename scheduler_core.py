@@ -154,16 +154,21 @@ class SchedulerCore:
         improvement_made_in_cycle = True
         
         try:
+            # Aumentar el número de ciclos por defecto si no se especifica
+            if max_improvement_loops < 120:
+                max_improvement_loops = 120
             while improvement_made_in_cycle and improvement_loop_count < max_improvement_loops:
                 improvement_made_in_cycle = False
                 loop_start_time = datetime.now()
-                
+
                 logging.info(f"--- Starting Improvement Loop {improvement_loop_count + 1} ---")
-                
-                # Apply improvement operations in sequence
+
+                # Priorizar llenado de huecos y balanceo homogéneo
                 improvement_operations = [
                     ("fill_empty_shifts", self.scheduler.schedule_builder._try_fill_empty_shifts),
                     ("balance_workloads", self.scheduler.schedule_builder._balance_workloads),
+                    ("fill_empty_shifts_2", self.scheduler.schedule_builder._try_fill_empty_shifts),
+                    ("balance_workloads_2", self.scheduler.schedule_builder._balance_workloads),
                     ("improve_weekend_distribution_1", self.scheduler.schedule_builder._improve_weekend_distribution),
                     ("distribute_holiday_shifts_proportionally", self.scheduler.schedule_builder.distribute_holiday_shifts_proportionally),
                     ("rebalance_weekend_distribution", self.scheduler.schedule_builder.rebalance_weekend_distribution),
@@ -171,11 +176,10 @@ class SchedulerCore:
                     ("improve_weekend_distribution_2", self.scheduler.schedule_builder._improve_weekend_distribution),
                     ("adjust_last_post_distribution", self.scheduler.schedule_builder._adjust_last_post_distribution),
                 ]
-                
+
                 for operation_name, operation_func in improvement_operations:
                     try:
                         if operation_name == "synchronize_tracking_data":
-                            # This operation always runs and doesn't return improvement status
                             operation_func()
                         else:
                             if operation_func():
@@ -183,21 +187,21 @@ class SchedulerCore:
                                 improvement_made_in_cycle = True
                     except Exception as e:
                         logging.warning(f"Operation {operation_name} failed: {str(e)}")
-                
+
                 loop_end_time = datetime.now()
                 loop_duration = (loop_end_time - loop_start_time).total_seconds()
                 logging.info(f"--- Improvement Loop {improvement_loop_count + 1} completed in {loop_duration:.2f}s. Changes made: {improvement_made_in_cycle} ---")
-                
+
                 if not improvement_made_in_cycle:
                     logging.info("No further improvements detected. Exiting improvement phase.")
-                
+
                 improvement_loop_count += 1
-            
+
             if improvement_loop_count >= max_improvement_loops:
                 logging.warning(f"Reached maximum improvement loops ({max_improvement_loops}). Stopping improvements.")
-            
+
             return True
-            
+
         except Exception as e:
             logging.error(f"Error during iterative improvement phase: {str(e)}", exc_info=True)
             return False
@@ -216,29 +220,47 @@ class SchedulerCore:
             logging.info("Performing final last post distribution adjustment...")
             max_iterations = self.config.get('last_post_adjustment_max_iterations', 
                                            SchedulerConfig.DEFAULT_LAST_POST_ADJUSTMENT_ITERATIONS)
-            
+
             if self.scheduler.schedule_builder._adjust_last_post_distribution(
                 balance_tolerance=1.0,
                 max_iterations=max_iterations
             ):
                 logging.info("Final last post distribution adjustment completed.")
-            
+
+
+            # PASADA EXTRA: Llenar huecos y balancear tras el ajuste final
+            logging.info("Extra pass: Filling empty shifts and balancing workloads after last post adjustment...")
+            self.scheduler.schedule_builder._try_fill_empty_shifts()
+            self.scheduler.schedule_builder._balance_workloads()
+
+            # Iterar hasta que todos los trabajadores estén dentro de la tolerancia ±1 en turnos y last posts
+            max_final_balance_loops = 50
+            for i in range(max_final_balance_loops):
+                logging.info(f"Final strict balance loop {i+1}/{max_final_balance_loops}")
+                changed1 = self.scheduler.schedule_builder._balance_workloads()
+                changed2 = self.scheduler.schedule_builder._adjust_last_post_distribution(balance_tolerance=1.0, max_iterations=10)
+                if not changed1 and not changed2:
+                    logging.info(f"Balance achieved after {i+1} iterations")
+                    break
+            else:
+                logging.warning(f"Max balance iterations ({max_final_balance_loops}) reached")
+
             # Get the best schedule
             final_schedule_data = self.scheduler.schedule_builder.get_best_schedule()
-            
+
             if not final_schedule_data or not final_schedule_data.get('schedule'):
                 logging.error("No best schedule data available for finalization.")
                 return self._handle_fallback_finalization()
-            
+
             # Update scheduler state with final schedule
             self._apply_final_schedule(final_schedule_data)
-            
-            # Final validation and logging
+
+            # Final validation y logging
             self._perform_final_validation()
-            
+
             logging.info("Schedule finalization phase completed successfully.")
             return True
-            
+
         except Exception as e:
             logging.error(f"Error during finalization phase: {str(e)}", exc_info=True)
             return False

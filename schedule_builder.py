@@ -1565,15 +1565,15 @@ class ScheduleBuilder:
         total_normalized = sum(data['normalized_count'] for data in assignment_counts.values())
         avg_normalized = total_normalized / len(assignment_counts) if assignment_counts else 0
 
-        # Identify overloaded and underloaded workers
+        # Identify overloaded and underloaded workers using absolute tolerance of ±1
         overloaded = []
         underloaded = []
 
         for worker_id_val, data_val in assignment_counts.items(): # Renamed worker_id, data
-            # Allow 10% deviation from average
-            if data_val['normalized_count'] > avg_normalized * 1.1:
+            # Use absolute tolerance of ±1 turno instead of percentage
+            if data_val['normalized_count'] > avg_normalized + 1.0:
                 overloaded.append((worker_id_val, data_val))
-            elif data_val['normalized_count'] < avg_normalized * 0.9:
+            elif data_val['normalized_count'] < avg_normalized - 1.0:
                 underloaded.append((worker_id_val, data_val))
 
         # Sort by most overloaded/underloaded
@@ -1581,7 +1581,7 @@ class ScheduleBuilder:
         underloaded.sort(key=lambda x: x[1]['normalized_count'])
 
         changes_made = 0
-        max_changes = 30  # Limit number of changes to avoid disrupting the schedule too much
+        max_changes = 100  # Aumentar para permitir más rebalanceos cuando sea necesario
 
         # Try to redistribute shifts from overloaded to underloaded workers
         for over_worker_id, over_data in overloaded:
@@ -1664,12 +1664,12 @@ class ScheduleBuilder:
                 
                         reassigned = True
                 
-                        # Check if workers are still overloaded/underloaded
-                        if assignment_counts[over_worker_id]['normalized_count'] <= avg_normalized * 1.1:
+                        # Check if workers are still overloaded/underloaded using absolute tolerance
+                        if assignment_counts[over_worker_id]['normalized_count'] <= avg_normalized + 1.0:
                             # No longer overloaded
                             overloaded = [(w, d_val_loop) for w, d_val_loop in overloaded if w != over_worker_id] # Renamed d to d_val_loop
                 
-                        if assignment_counts[under_worker_id]['normalized_count'] >= avg_normalized * 0.9:
+                        if assignment_counts[under_worker_id]['normalized_count'] >= avg_normalized - 1.0:
                             # No longer underloaded
                             underloaded = [(w, d_val_loop) for w, d_val_loop in underloaded if w != under_worker_id] # Renamed d to d_val_loop
                 
