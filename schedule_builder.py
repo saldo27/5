@@ -1016,7 +1016,8 @@ class ScheduleBuilder:
         """
         Calculate a score for a worker assignment during the improvement phase.
     
-        This uses a more lenient scoring approach to encourage filling empty shifts.
+        This uses a more lenient scoring approach to encourage filling empty shifts
+        with enhanced coverage-awareness for better post distribution.
         """
         worker_id = worker['id']
     
@@ -1054,9 +1055,151 @@ class ScheduleBuilder:
         # Bonus for underloaded workers
         if current_assignments < expected_assignments:
             base_score += 5 * (expected_assignments - current_assignments)
+
+        # NEW: Coverage-aware bonus - prioritize posts with lower coverage
+        coverage_bonus = self._calculate_coverage_priority_bonus(post, date)
+        base_score += coverage_bonus
     
         return base_score
+
+    def _calculate_coverage_priority_bonus(self, post, date):
+        """
+        Calculate bonus score for assignments that improve post coverage.
         
+        Args:
+            post: Post index to assign
+            date: Date of assignment
+            
+        Returns:
+            float: Bonus points for coverage improvement (0-50 points)
+        """
+        try:
+            # Calculate current coverage rates per post
+            post_coverage = {}
+            total_dates = 0
+            
+            for schedule_date, shifts in self.schedule.items():
+                total_dates += 1
+                for post_idx, worker in enumerate(shifts):
+                    if post_idx not in post_coverage:
+                        post_coverage[post_idx] = {'total': 0, 'filled': 0}
+                    
+                    post_coverage[post_idx]['total'] += 1
+                    if worker is not None:
+                        post_coverage[post_idx]['filled'] += 1
+            
+            if total_dates == 0 or post not in post_coverage:
+                return 0.0
+            
+            # Calculate coverage rate for this post
+            post_data = post_coverage[post]
+            if post_data['total'] == 0:
+                return 0.0
+                
+            current_coverage = post_data['filled'] / post_data['total']
+            
+            # Calculate average coverage across all posts
+            all_coverage_rates = []
+            for post_idx, data in post_coverage.items():
+                if data['total'] > 0:
+                    all_coverage_rates.append(data['filled'] / data['total'])
+            
+            if not all_coverage_rates:
+                return 0.0
+                
+            avg_coverage = sum(all_coverage_rates) / len(all_coverage_rates)
+            
+            # Bonus inversely proportional to coverage rate
+            # Posts with lower coverage get higher bonus
+            coverage_bonus = max(0, (avg_coverage - current_coverage) * 100)
+            
+            # Additional bonus for critical time periods (weekends/holidays)
+            if hasattr(self.scheduler, 'data_manager'):
+                if (self.scheduler.data_manager._is_weekend_day(date) or 
+                    self.scheduler.data_manager._is_holiday(date)):
+                    coverage_bonus *= 1.5  # 50% bonus for critical periods
+            
+            # Cap the bonus to prevent overwhelming other factors
+            return min(50.0, coverage_bonus)
+            
+        except Exception as e:
+            logging.warning(f"Error calculating coverage priority bonus: {e}")
+            return 0.0
+        
+    def _prioritize_empty_slots_by_coverage(self, empty_slots):
+        """
+        Prioritize empty slots based on coverage needs and critical periods.
+        
+        Args:
+            empty_slots: List of (date, post) tuples representing empty shifts
+            
+        Returns:
+            List of (date, post) tuples sorted by priority (highest first)
+        """
+        if not empty_slots:
+            return empty_slots
+        
+        try:
+            # Calculate current coverage rates per post
+            post_coverage = {}
+            for schedule_date, shifts in self.schedule.items():
+                for post_idx, worker in enumerate(shifts):
+                    if post_idx not in post_coverage:
+                        post_coverage[post_idx] = {'total': 0, 'filled': 0}
+                    
+                    post_coverage[post_idx]['total'] += 1
+                    if worker is not None:
+                        post_coverage[post_idx]['filled'] += 1
+            
+            # Calculate coverage rates
+            post_coverage_rates = {}
+            for post_idx, data in post_coverage.items():
+                if data['total'] > 0:
+                    post_coverage_rates[post_idx] = data['filled'] / data['total']
+                else:
+                    post_coverage_rates[post_idx] = 0.0
+            
+            # Create priority scores for each empty slot
+            prioritized_slots = []
+            for date, post in empty_slots:
+                priority_score = 0
+                
+                # Higher priority for posts with lower coverage
+                coverage_rate = post_coverage_rates.get(post, 0.0)
+                coverage_priority = (1.0 - coverage_rate) * 100  # 0-100 points
+                priority_score += coverage_priority
+                
+                # Critical period bonus (weekends/holidays)
+                if hasattr(self.scheduler, 'data_manager'):
+                    if (self.scheduler.data_manager._is_weekend_day(date) or 
+                        self.scheduler.data_manager._is_holiday(date)):
+                        priority_score += 50  # Bonus for critical periods
+                
+                # Chronological preference (slight bias toward earlier dates)
+                days_from_start = (date - self.start_date).days if hasattr(self, 'start_date') else 0
+                time_bonus = max(0, 50 - (days_from_start * 0.1))  # Gradually decrease bonus
+                priority_score += time_bonus
+                
+                prioritized_slots.append((date, post, priority_score))
+            
+            # Sort by priority score (highest first), then by date, then by post
+            prioritized_slots.sort(key=lambda x: (-x[2], x[0], x[1]))
+            
+            # Return just the (date, post) tuples
+            result = [(date, post) for date, post, _ in prioritized_slots]
+            
+            logging.info(f"Prioritized {len(result)} empty slots by coverage needs")
+            if len(result) > 0 and len(prioritized_slots) > 0:
+                logging.debug(f"Top priority slot: Date {result[0][0].strftime('%Y-%m-%d')}, Post {result[0][1]} (Score: {prioritized_slots[0][2]:.2f})")
+            
+            return result
+            
+        except Exception as e:
+            logging.warning(f"Error prioritizing empty slots by coverage: {e}")
+            # Fallback to original chronological sorting
+            empty_slots.sort(key=lambda x: (x[0], x[1]))
+            return empty_slots
+
     def _get_candidates(self, date, post, relaxation_level=0):
         """
         Get suitable candidates with their scores using the specified relaxation level
@@ -1333,7 +1476,9 @@ class ScheduleBuilder:
             return False
 
         logging.info(f"Attempting to fill {len(initial_empty_slots)} empty shifts...")
-        initial_empty_slots.sort(key=lambda x: (x[0], x[1])) # Process chronologically, then by post
+        
+        # Enhanced sorting: prioritize by coverage needs and critical periods
+        initial_empty_slots = self._prioritize_empty_slots_by_coverage(initial_empty_slots)
 
         shifts_filled_this_pass_total = 0
         made_change_overall = False
@@ -1483,10 +1628,84 @@ class ScheduleBuilder:
                     logging.debug(f"No swap for empty {date_empty.strftime('%Y-%m-%d')} P{post_empty}")
         
         logging.info(f"--- Finished _try_fill_empty_shifts. Total filled/swapped: {shifts_filled_this_pass_total} ---")
+        
+        # NEW: Pass 3 - Coverage-focused assignments with relaxed constraints for critical gaps
+        if remaining_empty_shifts_after_pass1:
+            logging.info(f"--- Starting Pass 3: Coverage-Focused Fill for {len(remaining_empty_shifts_after_pass1)} remaining gaps ---")
+            coverage_improvements = self._try_coverage_focused_fill(remaining_empty_shifts_after_pass1)
+            if coverage_improvements > 0:
+                logging.info(f"Pass 3: Filled {coverage_improvements} additional shifts through coverage optimization")
+                shifts_filled_this_pass_total += coverage_improvements
+                made_change_overall = True
+        
         if made_change_overall:
             self._synchronize_tracking_data() # Ensure builder's and scheduler's data are aligned
             self._save_current_as_best()
         return made_change_overall
+
+    def _try_coverage_focused_fill(self, empty_slots):
+        """
+        Coverage-focused pass that uses more relaxed constraints and intelligent scoring
+        to fill gaps in posts with the lowest coverage rates.
+        
+        Args:
+            empty_slots: List of (date, post) tuples representing unfilled shifts
+            
+        Returns:
+            int: Number of shifts filled in this pass
+        """
+        if not empty_slots:
+            return 0
+        
+        filled_count = 0
+        
+        try:
+            # Re-prioritize empty slots focusing on coverage urgency
+            coverage_urgent_slots = self._prioritize_empty_slots_by_coverage(empty_slots)
+            
+            for date, post in coverage_urgent_slots:
+                # Check if slot is still empty
+                if self.schedule[date][post] is not None:
+                    continue
+                
+                # Find candidates using enhanced improvement scoring
+                best_candidate = None
+                best_score = float('-inf')
+                
+                for worker_data in self.workers_data:
+                    worker_id = worker_data['id']
+                    
+                    # Use improvement scoring for coverage-aware selection
+                    score = self._calculate_improvement_score(worker_data, date, post)
+                    
+                    if score > best_score:
+                        # Additional validation to ensure we don't break hard constraints
+                        if self._can_assign_worker(worker_id, date, post):
+                            best_candidate = worker_data
+                            best_score = score
+                
+                # Make the assignment if we found a suitable candidate
+                if best_candidate is not None and best_score > float('-inf'):
+                    worker_id = best_candidate['id']
+                    
+                    # Final incompatibility check
+                    others_on_date = [w for i, w in enumerate(self.schedule.get(date, [])) 
+                                    if i != post and w is not None]
+                    if not self._check_incompatibility_with_list(worker_id, others_on_date):
+                        self.schedule[date][post] = worker_id
+                        self.worker_assignments.setdefault(worker_id, set()).add(date)
+                        
+                        # Update tracking data
+                        if hasattr(self.scheduler, '_update_tracking_data'):
+                            self.scheduler._update_tracking_data(worker_id, date, post, removing=False)
+                        
+                        filled_count += 1
+                        logging.info(f"[Coverage Pass] Filled {date.strftime('%Y-%m-%d')} Post {post} with {worker_id} (Score: {best_score:.2f})")
+                
+        except Exception as e:
+            logging.error(f"Error in coverage-focused fill: {e}")
+        
+        return filled_count
 
     def _find_swap_candidate(self, worker_W_id, conflict_date, conflict_post):
         """
