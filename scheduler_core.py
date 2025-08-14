@@ -167,6 +167,7 @@ class SchedulerCore:
                 improvement_operations = [
                     ("fill_empty_shifts", self.scheduler.schedule_builder._try_fill_empty_shifts),
                     ("balance_workloads", self.scheduler.schedule_builder._balance_workloads),
+                    ("balance_weekday_distribution", self.scheduler.schedule_builder._balance_weekday_distribution),
                     ("fill_empty_shifts_2", self.scheduler.schedule_builder._try_fill_empty_shifts),
                     ("balance_workloads_2", self.scheduler.schedule_builder._balance_workloads),
                     ("improve_weekend_distribution_1", self.scheduler.schedule_builder._improve_weekend_distribution),
@@ -232,6 +233,7 @@ class SchedulerCore:
             logging.info("Extra pass: Filling empty shifts and balancing workloads after last post adjustment...")
             self.scheduler.schedule_builder._try_fill_empty_shifts()
             self.scheduler.schedule_builder._balance_workloads()
+            self.scheduler.schedule_builder._balance_weekday_distribution()
 
             # Iterar hasta que todos los trabajadores estén dentro de la tolerancia ±1 en turnos y last posts
             max_final_balance_loops = 50
@@ -239,7 +241,8 @@ class SchedulerCore:
                 logging.info(f"Final strict balance loop {i+1}/{max_final_balance_loops}")
                 changed1 = self.scheduler.schedule_builder._balance_workloads()
                 changed2 = self.scheduler.schedule_builder._adjust_last_post_distribution(balance_tolerance=1.0, max_iterations=10)
-                if not changed1 and not changed2:
+                changed3 = self.scheduler.schedule_builder._balance_weekday_distribution()
+                if not changed1 and not changed2 and not changed3:
                     logging.info(f"Balance achieved after {i+1} iterations")
                     break
             else:
